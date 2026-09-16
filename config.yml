@@ -1,0 +1,241 @@
+version: 2.1
+
+jobs:
+  build-android:
+    docker:
+      - image: unityci/editor:ubuntu-2022.3.62f3-android-3
+
+    resource_class: large
+    working_directory: ~/project
+
+    environment:
+      PROJECT_ZIP: supreme_duelist_circleci_final.zip
+      PROJECT_DIR: unity_project
+      ARTIFACT_DIR: /tmp/circleci-artifacts
+
+    steps:
+      - checkout
+
+      - run:
+          name: Verify CircleCI Unity container
+          command: |
+            set -euo pipefail
+
+            mkdir -p "$ARTIFACT_DIR"
+            : > "$ARTIFACT_DIR/unity-build.log"
+
+            command -v unity-editor >/dev/null 2>&1
+            command -v xvfb-run >/dev/null 2>&1
+            command -v unzip >/dev/null 2>&1
+            command -v base64 >/dev/null 2>&1
+            command -v find >/dev/null 2>&1
+            command -v head >/dev/null 2>&1
+
+            echo "Unity executable: $(command -v unity-editor)"
+            unity-editor -version
+
+      - run:
+          name: Extract and verify Unity project
+          command: |
+            set -euo pipefail
+
+            test -s "$PROJECT_ZIP"
+
+            rm -rf "$PROJECT_DIR"
+            mkdir -p "$PROJECT_DIR"
+
+            unzip -q "$PROJECT_ZIP" -d "$PROJECT_DIR"
+
+            test -d "$PROJECT_DIR/Assets"
+            test -d "$PROJECT_DIR/Packages"
+            test -d "$PROJECT_DIR/ProjectSettings"
+
+            test -f "$PROJECT_DIR/Packages/manifest.json"
+            test -f "$PROJECT_DIR/ProjectSettings/ProjectVersion.txt"
+
+            test -f \
+              "$PROJECT_DIR/Assets/SupremeDuelist/Reconstruction/Editor/AndroidBuild.cs"
+
+            test -f \
+              "$PROJECT_DIR/Assets/SupremeDuelist/Reconstruction/Editor/AndroidPreflight.cs"
+
+            grep -q '^m_EditorVersion: 2022.3.62f3$' \
+              "$PROJECT_DIR/ProjectSettings/ProjectVersion.txt"
+
+            BUNDLE_DIR="$PROJECT_DIR/Assets/StreamingAssets/Recovered"
+            test -d "$BUNDLE_DIR"
+
+            BUNDLE_COUNT="$(
+              find "$BUNDLE_DIR" \
+                -maxdepth 1 \
+                -type f \
+                -name '*.bundle' \
+                | wc -l \
+                | tr -d '[:space:]'
+            )"
+
+            test "$BUNDLE_COUNT" = "7"
+
+            for bundle in "$BUNDLE_DIR"/*.bundle; do
+              test "$(head -c 7 "$bundle")" = "UnityFS"
+            done
+
+            echo "Project structure, Unity version and seven UnityFS bundles verified."
+
+      - run:
+          name: Prepare Unity license
+          command: |
+            set -euo pipefail
+
+            LICENSE_DIR="$HOME/.local/share/unity3d/Unity"
+            ACT_DIR="/tmp/unity-activation"
+
+            mkdir -p "$LICENSE_DIR" "$ARTIFACT_DIR"
+            rm -f /tmp/UNITY_LICENSE_REQUIRED
+
+            if [ -n "${UNITY_ENCODED_LICENSE:-}" ]; then
+              printf '%s' "$UNITY_ENCODED_LICENSE" \
+                | tr -d '\r\n ' \
+                | base64 --decode \
+                > "$LICENSE_DIR/Unity_lic.ulf"
+
+              test -s "$LICENSE_DIR/Unity_lic.ulf"
+
+              echo "Unity Personal license installed."
+
+            elif [ -n "${UNITY_SERIAL:-}" ] \
+              && [ -n "${UNITY_USERNAME:-}" ] \
+              && [ -n "${UNITY_PASSWORD:-}" ]; then
+
+              xvfb-run \
+                --auto-servernum \
+                --server-args='-screen 0 640x480x24' \
+                unity-editor \
+                -batchmode \
+                -nographics \
+                -quit \
+                -logFile /dev/stdout \
+                -username "$UNITY_USERNAME" \
+                -password "$UNITY_PASSWORD" \
+                -serial "$UNITY_SERIAL"
+
+              echo "Unity Professional license activated."
+
+            else
+              echo "No Unity license configured."
+              echo "Generating Unity.alf for Personal activation."
+
+              rm -rf "$ACT_DIR"
+              mkdir -p "$ACT_DIR"
+
+              cd "$ACT_DIR"
+
+              xvfb-run \
+                --auto-servernum \
+                --server-args='-screen 0 640x480x24' \
+                unity-editor \
+                -batchmode \
+                -nographics \
+                -quit \
+                -logFile /dev/stdout \
+                -createManualActivationFile \
+                || true
+
+              ALF="$(
+                find "$ACT_DIR" "$HOME" \
+                  -type f \
+                  -name '*.alf' \
+                  2>/dev/null \
+                  | head -n 1 \
+                  || true
+              )"
+
+              if [ -n "$ALF" ] && [ -s "$ALF" ]; then
+                cp "$ALF" "$ARTIFACT_DIR/Unity.alf"
+              else
+                printf '%s\n' \
+                  'Unity license is not configured.' \
+                  'Set UNITY_ENCODED_LICENSE for Personal, or UNITY_SERIAL + UNITY_USERNAME + UNITY_PASSWORD for Pro/Plus.' \
+                  > "$ARTIFACT_DIR/LICENSE_REQUIRED.txt"
+              fi
+
+              touch /tmp/UNITY_LICENSE_REQUIRED
+            fi
+
+      - run:
+          name: Build Android APK
+          no_output_timeout: 40m
+          command: |
+            set -euo pipefail
+
+            cd "$HOME/project"
+            mkdir -p "$ARTIFACT_DIR"
+
+            if [ -f /tmp/UNITY_LICENSE_REQUIRED ]; then
+              echo "Unity activation is required before APK compilation."
+              echo "Open this job's Artifacts tab and download Unity.alf if available."
+              exit 12
+            fi
+
+            BUILD_CODE=0
+
+            xvfb-run \
+              --auto-servernum \
+              --server-args='-screen 0 640x480x24' \
+              unity-editor \
+              -batchmode \
+              -nographics \
+              -quit \
+              -projectPath "$PWD/$PROJECT_DIR" \
+              -buildTarget Android \
+              -executeMethod SupremeDuelist.Reconstruction.Editor.AndroidBuild.BuildDebug \
+              -logFile "$ARTIFACT_DIR/unity-build.log" \
+              || BUILD_CODE=$?
+
+            if [ "$BUILD_CODE" -ne 0 ]; then
+              echo "Unity returned code $BUILD_CODE."
+              echo "Last 250 Unity log lines:"
+              tail -n 250 "$ARTIFACT_DIR/unity-build.log" || true
+              exit "$BUILD_CODE"
+            fi
+
+            APK="$PROJECT_DIR/Builds/Android/SupremeDuelist-Reconstructed-debug.apk"
+
+            test -s "$APK"
+
+            cp "$APK" \
+              "$ARTIFACT_DIR/SupremeDuelist-debug.apk"
+
+            echo "APK created successfully:"
+            ls -lh "$ARTIFACT_DIR/SupremeDuelist-debug.apk"
+
+      - run:
+          name: Return Unity Professional license
+          when: always
+          command: |
+            if [ -n "${UNITY_SERIAL:-}" ] \
+              && [ -n "${UNITY_USERNAME:-}" ] \
+              && [ -n "${UNITY_PASSWORD:-}" ]; then
+
+              xvfb-run \
+                --auto-servernum \
+                --server-args='-screen 0 640x480x24' \
+                unity-editor \
+                -batchmode \
+                -nographics \
+                -quit \
+                -returnlicense \
+                -logFile /dev/stdout \
+                -username "$UNITY_USERNAME" \
+                -password "$UNITY_PASSWORD" \
+                || true
+            fi
+
+      - store_artifacts:
+          path: /tmp/circleci-artifacts
+          destination: output
+
+workflows:
+  main:
+    jobs:
+      - build-android
